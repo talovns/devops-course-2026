@@ -124,6 +124,8 @@ sudo ufw logging medium
 | `01-clean-install` | 28.10.2026 18:39 | чистая установка, SSH-сервер установлен, обновления применены |
 | `02-keys-configured` | 28.10.2026 19:05 | пользователь `devops`, ключ, `ssh devops` без пароля |
 | `03-ssh-hardened` | 28.10.2026 19:11 | усиление защиты SSH, порт 2222, вход по ключу, root и пароли запрещены |
+| `04-nginx-https` | 28.10.2026 19:41 | nginx, ресурс `devops-site` по HTTPS, перенаправление HTTP -> HTTPS |
+| `05-docker-compose` | 28.10.2026 21:58 | Docker Engine, проект `~/app` (приложение + PostgreSQL) запущен |
 
 Имя узла: `hostnamectl set-hostname devops-vm`, в `/etc/hosts` строка `127.0.1.1 devops-vm.devops.local devops-vm`; на хостовой системе в `hosts` добавлено `192.168.56.101    devops.local`.
 
@@ -154,3 +156,45 @@ sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
 Конфигурация состоит из двух блоков `server`: порт 80 возвращает `301 https://$host$request_uri`; порт 443 (`ssl`, протоколы TLSv1.2 и TLSv1.3) отдаёт содержимое `root /var/www/devops-site`, страницу ошибки `404.html`. Заголовок HSTS не используется. Любое изменение применяется командой `sudo nginx -t && sudo systemctl reload nginx` (не `restart`).
 Сертификат передаётся на хостовую систему по SSH: `scp devops:/etc/ssl/certs/devops.crt ~/devops.crt`; проверка клиентом: `curl --cacert ~/devops.crt https://devops.local`.
 Порты 80 и 443 уже разрешены правилами UFW из раздела 6, профили `Nginx HTTP/HTTPS/Full` не применяются.
+
+## 9. Контейнеризация
+
+Docker Engine установлен из официального репозитория Docker (`https://download.docker.com/linux/ubuntu`, набор `resolute`, ключ `/etc/apt/keyrings/docker.asc`, источник `/etc/apt/sources.list.d/docker.sources`) по инструкции docs.docker.com. Пакет `docker.io` из репозитория Ubuntu не используется (перед установкой проверено, что его нет).
+
+```bash
+sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+sudo usermod -aG docker devops     # применяется в новой SSH-сессии
+```
+
+| Параметр | Значение |
+|---|---|
+| Версии | Docker Engine 29.9.2 (клиент и сервер), Docker Compose v5.6.1, containerd.io 2.4.2 |
+| Служба | `docker.service`, включена и активна |
+| Группа `docker` | только `devops` (участник группы фактически получает права root, поэтому в группу включаются только учётные записи с правом sudo) |
+| Каталог проекта | `/home/devops/app` (владелец `devops`, каталоги `755`, файлы `644`); имя проекта Compose `app` |
+| Исходный код | каталог `app/` репозитория; доставка `rsync -avz --delete --exclude=.env --chmod=D755,F644 app/ devops:app/`, сначала с `--dry-run` |
+| Файл секретов | `/home/devops/app/.env`, права `600`, владелец `devops`; создаётся только на сервере из `.env.example`, пароль `openssl rand -hex 16`; в репозиторий не попадает (`.gitignore`, `.dockerignore`) |
+| Образы | `devops-app:1.0` (собирается из `app/Dockerfile`, процесс от пользователя `app`), `postgres:16-alpine` |
+| Контейнеры | `app-app-1`, `app-db-1`; `restart: unless-stopped` (поднимаются после перезагрузки) |
+| Сеть | `app_backend` (bridge), имя СУБД внутри сети: `db` |
+| Публикуемые порты | приложение: только `127.0.0.1:5000`; порт СУБД `5432` не публикуется |
+| Именованный том | `app_db_data` -> `/var/lib/postgresql/data`; удаляется только `docker compose down -v` (на рабочем сервере не применять) |
+| Проверка готовности СУБД | `pg_isready` каждые 5 с; приложение запускается после состояния `healthy` |
+
+Запуск и обновление: `cd ~/app && docker compose up -d --build`; состояние: `docker compose ps`; журнал: `docker compose logs app`.
+
+Публикация через обратный прокси-сервер: в блок HTTPS `/etc/nginx/sites-available/devops-site` добавлено расположение (статический ресурс `location /` сохранён):
+
+```nginx
+location /app/ {
+    proxy_pass http://127.0.0.1:5000/;
+    proxy_set_header Host              $host;
+    proxy_set_header X-Real-IP         $remote_addr;
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}
+```
+
+Завершающий `/` в `proxy_pass` заменяет префикс: запрос `https://devops.local/app/health` передаётся приложению как `/health`. Применение: `sudo nginx -t && sudo systemctl reload nginx`. Если контейнер приложения остановлен, nginx отвечает `502 Bad Gateway`, в `/var/log/nginx/devops-site.error.log` запись `connect() failed (111: Connection refused) while connecting to upstream`.
+
+Публикация `-p 5001:5000` (на всех адресах) обходит UFW: Docker добавляет собственные правила в iptables до цепочек UFW. Поэтому порт приложения публикуется только на `127.0.0.1`, а наружу ресурс доступен через nginx по HTTPS (порт 443).
