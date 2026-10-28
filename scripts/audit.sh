@@ -46,5 +46,17 @@ writable=$(find /var/www/devops-site -perm -o+w 2>/dev/null | wc -l)
 check "В каталоге ресурса нет файлов с записью для всех" "0" "$writable"
 check "Права закрытого ключа равны 600" "600" "$(sudo stat -c '%a' /etc/ssl/private/devops.key)"
 
+echo "[5] Контейнеризация"
+APP_DIR="${APP_DIR:-$HOME/app}"
+# а) служба docker активна
+check "Служба docker активна" "active" "$(systemctl is-active docker)"
+# б) контейнер СУБД в состоянии healthy
+check "Контейнер СУБД в состоянии healthy" "healthy" "$(docker inspect -f '{{.State.Health.Status}}' app-db-1 2>/dev/null)"
+# в) порты 5000 и 5432 не прослушиваются ни на одном адресе, кроме 127.0.0.1
+exposed=$(ss -tlnH | awk '{print $4}' | grep -E ':(5000|5432)$' | grep -vc '^127\.0\.0\.1:')
+check "Порты 5000 и 5432 только на 127.0.0.1" "0" "$exposed"
+# г) права файла ~/app/.env равны 600
+check "Права ${APP_DIR}/.env равны 600" "600" "$(stat -c '%a' "${APP_DIR}/.env" 2>/dev/null)"
+
 echo "Пройдено: $PASS, не пройдено: $FAIL"
 [[ $FAIL -eq 0 ]] && exit 0 || exit 1
