@@ -1,6 +1,6 @@
 # Конфигурация виртуальной машины devops-vm
 
-Документ позволяет восстановить машину с нуля до состояния снимка `03-ssh-hardened`.
+Документ позволяет восстановить машину с нуля до итогового состояния ПР №5 (снимок `03-ssh-hardened` плюс межсетевой экран и имя узла).
 Хост: Windows, VirtualBox 7.x. Гостевая ОС: Ubuntu Server 26.04.1 LTS (установочный образ `ubuntu-26.04.1-live-server-amd64.iso`).
 
 ## 1. Параметры машины
@@ -123,6 +123,34 @@ sudo ufw logging medium
 |---|---|---|
 | `01-clean-install` | 28.10.2026 18:39 | чистая установка, SSH-сервер установлен, обновления применены |
 | `02-keys-configured` | 28.10.2026 19:05 | пользователь `devops`, ключ, `ssh devops` без пароля |
-| `03-ssh-hardened` | 28.10.2026 19:11 | усиление защиты SSH, порт 2222, UFW, имя `devops.local` |
+| `03-ssh-hardened` | 28.10.2026 19:11 | усиление защиты SSH, порт 2222, вход по ключу, root и пароли запрещены |
 
 Имя узла: `hostnamectl set-hostname devops-vm`, в `/etc/hosts` строка `127.0.1.1 devops-vm.devops.local devops-vm`; на хостовой системе в `hosts` добавлено `192.168.56.101    devops.local`.
+
+## 8. Веб-сервер
+
+Пакет: `nginx` (из репозитория Ubuntu, `sudo apt install -y nginx`). Служба `nginx.service`: главный процесс от `root`, рабочие от `www-data`.
+
+| Параметр | Значение |
+|---|---|
+| Конфигурация ресурса | `/etc/nginx/sites-available/devops-site`, активирована ссылкой `/etc/nginx/sites-enabled/devops-site` |
+| Стандартный ресурс | ссылка `/etc/nginx/sites-enabled/default` удалена (конфигурация сохранена) |
+| Каталог ресурса | `/var/www/devops-site`, владелец `devops:devops`, каталоги `755`, файлы `644` |
+| Журналы ресурса | `/var/log/nginx/devops-site.access.log`, `/var/log/nginx/devops-site.error.log` |
+| Сертификат | `/etc/ssl/certs/devops.crt`, права `644`, владелец `root` |
+| Закрытый ключ | `/etc/ssl/private/devops.key`, права `600`, владелец `root` |
+| Срок действия сертификата | 365 дней (выпущен 28.10.2026) |
+
+Команда формирования сертификата (самоподписанный, с полем SAN):
+
+```bash
+sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+  -keyout /etc/ssl/private/devops.key \
+  -out /etc/ssl/certs/devops.crt \
+  -subj "/CN=devops.local" \
+  -addext "subjectAltName=DNS:devops.local"
+```
+
+Конфигурация состоит из двух блоков `server`: порт 80 возвращает `301 https://$host$request_uri`; порт 443 (`ssl`, протоколы TLSv1.2 и TLSv1.3) отдаёт содержимое `root /var/www/devops-site`, страницу ошибки `404.html`. Заголовок HSTS не используется. Любое изменение применяется командой `sudo nginx -t && sudo systemctl reload nginx` (не `restart`).
+Сертификат передаётся на хостовую систему по SSH: `scp devops:/etc/ssl/certs/devops.crt ~/devops.crt`; проверка клиентом: `curl --cacert ~/devops.crt https://devops.local`.
+Порты 80 и 443 уже разрешены правилами UFW из раздела 6, профили `Nginx HTTP/HTTPS/Full` не применяются.
